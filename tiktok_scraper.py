@@ -5,15 +5,16 @@ Strategy
 --------
 1. Resolve any short URL (vm.tiktok.com) to canonical form via HTTP HEAD.
 2. Pull basic metadata from the TikTok oEmbed endpoint (no auth required).
-3. Launch a headless Chromium browser, load tiktok.com/embed/v2/<video_id>,
-   and extract metadata from two sources (in priority order):
-     a. The inline page JSON embedded in a <script> tag — the most reliable
-        source for the actual video's caption, author, and hashtags.
-     b. Intercepted XHR responses from /api/item/detail/ — may include
-        AI-generated summary and keywords for newer videos.
-     c. DOM fallback after clicking the "more" button.
-4. Recommended-video API responses (/api/recommend/) are filtered to only
-   use the item matching the requested video_id.
+3. Embed page (tiktok.com/embed/v2/<video_id>) via headless Chromium:
+     a. Parse the inline <script> JSON (videoData) — caption, author, hashtags.
+     b. Intercept /api/item/detail/ XHR if fired.
+     c. DOM fallback for AI summary / keywords after clicking "more".
+4. Full page (tiktok.com/@user/video/<id>) via headless Chromium:
+     Extracts __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON which contains:
+     - itemStruct.suggestedWords  → keywords
+     - itemStruct.diversificationLabels → content categories
+     - itemStruct.creatorAIComment → AI topic summary (when eligible)
+     - Page <title> → server-generated AI title (always present)
 """
 
 import asyncio
@@ -39,12 +40,14 @@ class TikTokMetadata:
     video_id: Optional[str] = None
     author: Optional[str] = None
     author_url: Optional[str] = None
-    title: Optional[str] = None
+    title: Optional[str] = None           # oEmbed caption (may be truncated)
+    ai_title: Optional[str] = None        # server-generated AI title from <title>
     description: Optional[str] = None
     thumbnail_url: Optional[str] = None
     hashtags: list[str] = field(default_factory=list)
-    keywords: list[str] = field(default_factory=list)
-    ai_summary: Optional[str] = None
+    keywords: list[str] = field(default_factory=list)   # suggestedWords
+    categories: list[str] = field(default_factory=list) # diversificationLabels
+    ai_summary: Optional[str] = None      # creatorAIComment (when eligible)
     embed_html: Optional[str] = None
     source: list[str] = field(default_factory=list)
 
@@ -380,6 +383,130 @@ async def scrape_embed(video_id: str, meta: TikTokMetadata) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Full page scraping (tiktok.com/@user/video/<id>)
+# ---------------------------------------------------------------------------
+
+REHYDRATION_KEY = "__UNIVERSAL_DATA_FOR_REHYDRATION__"
+
+
+def parse_full_page_html(html: str, meta: TikTokMetadata) -> bool:
+    """
+    Extract metadata from the __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON blob
+    embedded in the full tiktok.com video page.
+
+    Key fields extracted:
+      itemStruct.suggestedWords       → keywords
+      itemStruct.diversificationLabels → categories
+      itemStruct.creatorAIComment     → AI topic summary (when hasAITopic=True)
+      Page <title>                    → AI-generated title (strip "| TikTok")
+    """
+    # AI title from <title> tag (server-generated, always present)
+    title_m = re.search(r"<title[^>]*>(.*?)</title>", html)
+    if title_m:
+        raw = title_m.group(1).strip()
+        ai_title = re.sub(r"\s*\|\s*TikTok\s*$", "", raw).strip()
+        if ai_title:
+            meta.ai_title = ai_title
+
+    # Parse the rehydration JSON
+    m = re.search(
+        rf'id="{REHYDRATION_KEY}"[^>]*>(\{{.*?\}})</script>',
+        html,
+        re.DOTALL,
+    )
+    if not m:
+        return bool(meta.ai_title)
+
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return bool(meta.ai_title)
+
+    item = (
+        data.get("__DEFAULT_SCOPE__", {})
+        .get("webapp.video-detail", {})
+        .get("itemInfo", {})
+        .get("itemStruct", {})
+    )
+    if not item:
+        return bool(meta.ai_title)
+
+    # suggestedWords → keywords
+    for w in item.get("suggestedWords", []):
+        if isinstance(w, str) and w and w not in meta.keywords:
+            meta.keywords.append(w)
+
+    # diversificationLabels → categories (deduplicated)
+    for label in item.get("diversificationLabels", []):
+        if isinstance(label, str) and label and label not in meta.categories:
+            meta.categories.append(label)
+
+    # creatorAIComment — full AI topic summary when eligible
+    ai_comment = item.get("creatorAIComment", {})
+    if ai_comment.get("hasAITopic"):
+        # categoryList contains the topic summaries
+        for cat in ai_comment.get("categoryList", []):
+            text = cat.get("categoryDesc") or cat.get("title") or ""
+            if text and not meta.ai_summary:
+                meta.ai_summary = text
+
+    # AIGCDescription — present on AI-generated videos
+    aigc = item.get("AIGCDescription", "").strip()
+    if aigc and not meta.ai_summary:
+        meta.ai_summary = aigc
+
+    # Fill in any gaps missed by the embed scrape
+    if not meta.description:
+        desc = item.get("desc", "").strip()
+        if desc:
+            meta.description = desc
+
+    if not meta.author:
+        author = item.get("author", {})
+        meta.author = author.get("nickname") or author.get("uniqueId")
+
+    meta.source.append("full_page")
+    return True
+
+
+async def scrape_full_page(canonical_url: str, meta: TikTokMetadata) -> None:
+    """Navigate to the full tiktok.com video page and extract metadata."""
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+        )
+        page = await context.new_page()
+        try:
+            print(f"[full_page] loading {canonical_url}", file=sys.stderr)
+            await page.goto(canonical_url, wait_until="networkidle", timeout=30_000)
+            html = await page.content()
+
+            if parse_full_page_html(html, meta):
+                print(f"[full_page] ai_title={meta.ai_title!r}", file=sys.stderr)
+            else:
+                print("[full_page] rehydration JSON not found", file=sys.stderr)
+
+            if "--debug" in sys.argv:
+                debug_path = f"/tmp/tiktok_full_{meta.video_id}.html"
+                with open(debug_path, "w") as f:
+                    f.write(html)
+                print(f"[debug] full page HTML saved to {debug_path}", file=sys.stderr)
+
+        except PWTimeout:
+            print("[full_page] timed out", file=sys.stderr)
+        except Exception as exc:
+            print(f"[full_page] error: {exc}", file=sys.stderr)
+        finally:
+            await browser.close()
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -400,9 +527,12 @@ async def extract(url: str) -> TikTokMetadata:
         parse_oembed(oembed_data, meta)
 
     if meta.video_id:
+        # Run embed scrape and full-page scrape sequentially to avoid
+        # launching two Chromium instances simultaneously.
         await scrape_embed(meta.video_id, meta)
+        await scrape_full_page(meta.url, meta)
     else:
-        print("[embed] skipped — no video ID", file=sys.stderr)
+        print("[embed/full_page] skipped — no video ID", file=sys.stderr)
 
     return meta
 
