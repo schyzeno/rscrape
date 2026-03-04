@@ -8,13 +8,13 @@ Strategy
 3. Embed page (tiktok.com/embed/v2/<video_id>) via headless Chromium:
      a. Parse the inline <script> JSON (videoData) — caption, author, hashtags.
      b. Intercept /api/item/detail/ XHR if fired.
-     c. DOM fallback for AI summary / keywords after clicking "more".
 4. Full page (tiktok.com/@user/video/<id>) via headless Chromium:
      Extracts __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON which contains:
      - itemStruct.suggestedWords  → keywords
      - itemStruct.diversificationLabels → content categories
-     - itemStruct.creatorAIComment → AI topic summary (when eligible)
+     - <meta name="description"> → AI-expanded description (ai_summary)
      - Page <title> → server-generated AI title (always present)
+     - Clicks "more" button to confirm expanded description from DOM
 """
 
 import asyncio
@@ -351,22 +351,6 @@ async def scrape_embed(video_id: str, meta: TikTokMetadata) -> None:
             else:
                 print("[embed] inline page JSON not found", file=sys.stderr)
 
-            # Click "more" to trigger any lazy-loaded summary API call
-            clicked = await _try_click_more(page)
-            if clicked:
-                print("[embed] clicked 'more' button", file=sys.stderr)
-                await page.wait_for_timeout(1500)
-                # Give interceptor a moment to fire
-                html2 = await page.content()
-                if "page_json" not in meta.source:
-                    parse_page_json(html2, video_id, meta)
-
-            # DOM fallback for summary / keywords if still missing
-            if not meta.ai_summary or not meta.keywords:
-                await _dom_fallback(page, meta)
-                if meta.ai_summary or meta.keywords:
-                    meta.source.append("embed_dom")
-
             if "--debug" in sys.argv:
                 debug_path = f"/tmp/tiktok_embed_{video_id}.html"
                 with open(debug_path, "w") as f:
@@ -407,6 +391,17 @@ def parse_full_page_html(html: str, meta: TikTokMetadata) -> bool:
         ai_title = re.sub(r"\s*\|\s*TikTok\s*$", "", raw).strip()
         if ai_title:
             meta.ai_title = ai_title
+
+    # Expanded description from <meta name="description">
+    # Format: "{N} Likes, {N} Comments. TikTok video from {Name} (@handle): '{expanded_desc}'. {hashtags}"
+    og_desc = re.search(r'<meta name="description" content="([^"]+)"', html)
+    if og_desc:
+        raw = og_desc.group(1)
+        desc_m = re.search(r":\s+'(.+?)'\.", raw, re.DOTALL)
+        if desc_m:
+            expanded = desc_m.group(1).strip()
+            if expanded and expanded != meta.description:
+                meta.ai_summary = expanded
 
     # Parse the rehydration JSON
     m = re.search(
@@ -491,6 +486,19 @@ async def scrape_full_page(canonical_url: str, meta: TikTokMetadata) -> None:
                 print(f"[full_page] ai_title={meta.ai_title!r}", file=sys.stderr)
             else:
                 print("[full_page] rehydration JSON not found", file=sys.stderr)
+
+            # Click "more" on the full page to confirm/extend expanded description
+            clicked = await _try_click_more(page)
+            if clicked:
+                print("[full_page] clicked 'more' button", file=sys.stderr)
+                try:
+                    loc = page.locator("[data-e2e='video-desc']").first
+                    expanded = (await loc.inner_text(timeout=3000)).strip()
+                    if expanded and (not meta.description or len(expanded) > len(meta.description)):
+                        meta.description = expanded
+                        print(f"[full_page] updated description from DOM: {expanded[:60]!r}", file=sys.stderr)
+                except Exception:
+                    pass
 
             if "--debug" in sys.argv:
                 debug_path = f"/tmp/tiktok_full_{meta.video_id}.html"
