@@ -515,6 +515,86 @@ async def scrape_full_page(canonical_url: str, meta: TikTokMetadata) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Thumbnail capture
+# ---------------------------------------------------------------------------
+
+async def capture_thumbnail(video_id: str, output_path: str) -> str:
+    """
+    Load the embed page and take a 1:1 screenshot centred on the video render
+    area.  The embed page is a clean player with no sidebar or comments.
+
+    Strategy
+    --------
+    1. Set viewport to 540×960 (9:16 portrait) so the player fills the window.
+    2. Wait for the <video> element to appear (it may take a moment to load).
+    3. Get the bounding box of the video element.
+    4. Compute a square clip: side = min(width, height), centred on the box.
+    5. Screenshot that clip to output_path.
+
+    Falls back to clipping the full viewport if the video element is not found.
+    """
+    embed_url = f"{EMBED_BASE}{video_id}"
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="en-US",
+            viewport={"width": 540, "height": 960},
+        )
+        page = await context.new_page()
+        try:
+            print(f"[thumbnail] loading {embed_url}", file=sys.stderr)
+            await page.goto(embed_url, wait_until="networkidle", timeout=30_000)
+
+            # Try to find the video element and get its bounding box
+            clip = None
+            try:
+                video_el = page.locator("video").first
+                await video_el.wait_for(state="attached", timeout=8_000)
+                box = await video_el.bounding_box()
+                if box and box["width"] > 0 and box["height"] > 0:
+                    side = min(box["width"], box["height"])
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+                    clip = {
+                        "x": cx - side / 2,
+                        "y": cy - side / 2,
+                        "width": side,
+                        "height": side,
+                    }
+                    print(
+                        f"[thumbnail] video box {box['width']:.0f}×{box['height']:.0f} "
+                        f"→ clip {side:.0f}×{side:.0f} at ({clip['x']:.0f},{clip['y']:.0f})",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:
+                print(f"[thumbnail] video element not found, using viewport centre: {exc}", file=sys.stderr)
+
+            if clip is None:
+                # Fallback: centre-crop the full 540×960 viewport to 540×540
+                side = 540
+                clip = {"x": 0, "y": (960 - side) / 2, "width": side, "height": side}
+
+            await page.screenshot(path=output_path, clip=clip)
+            print(f"[thumbnail] saved to {output_path}", file=sys.stderr)
+            return output_path
+
+        except PWTimeout:
+            print("[thumbnail] timed out", file=sys.stderr)
+            raise
+        except Exception as exc:
+            print(f"[thumbnail] error: {exc}", file=sys.stderr)
+            raise
+        finally:
+            await browser.close()
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -550,12 +630,49 @@ async def extract(url: str) -> TikTokMetadata:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if not args:
-        print("Usage: python tiktok_scraper.py <tiktok_url> [--debug]")
+        print("Usage: python tiktok_scraper.py <tiktok_url> [--debug] [--thumbnail]")
         sys.exit(1)
 
-    meta = await extract(args[0])
+    url = args[0]
+
+    if "--thumbnail" in flags:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            canonical = await resolve_url(url, client)
+            video_id = extract_video_id(canonical)
+            if not video_id:
+                print("Error: could not extract video ID from URL", file=sys.stderr)
+                sys.exit(1)
+            out = f"/tmp/tiktok_thumb_{video_id}"
+
+            # Fast path: download the oEmbed thumbnail_url directly
+            oembed_data = await fetch_oembed(canonical, client)
+            thumb_url = oembed_data.get("thumbnail_url")
+            if thumb_url:
+                print(f"[thumbnail] downloading {thumb_url}", file=sys.stderr)
+                try:
+                    resp = await client.get(thumb_url, timeout=15)
+                    resp.raise_for_status()
+                    ct = resp.headers.get("content-type", "image/jpeg")
+                    ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}.get(ct.split(";")[0].strip(), "jpg")
+                    out_path = f"{out}.{ext}"
+                    with open(out_path, "wb") as f:
+                        f.write(resp.content)
+                    print(f"[thumbnail] saved to {out_path}", file=sys.stderr)
+                    print(out_path)
+                    return
+                except Exception as exc:
+                    print(f"[thumbnail] oEmbed download failed: {exc}, falling back to Playwright", file=sys.stderr)
+
+        # Fallback: Playwright screenshot of the embed page
+        out_path = f"{out}.png"
+        await capture_thumbnail(video_id, out_path)
+        print(out_path)
+        return
+
+    meta = await extract(url)
     print(json.dumps(asdict(meta), indent=2, ensure_ascii=False))
 
 
