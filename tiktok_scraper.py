@@ -26,8 +26,38 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import httpx
-from playwright.async_api import async_playwright, Page, Response
+from playwright.async_api import async_playwright, Page, Response, Browser
 from playwright.async_api import TimeoutError as PWTimeout
+
+
+# ---------------------------------------------------------------------------
+# Browser constants
+# ---------------------------------------------------------------------------
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+# Chromium flags that cut startup time and reduce resource usage
+_BROWSER_ARGS = [
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-sandbox",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--mute-audio",
+]
+
+
+async def _block_heavy_resources(route) -> None:
+    """Abort image / font / media requests; we only need text data."""
+    if route.request.resource_type in ("image", "font", "media"):
+        await route.abort()
+    else:
+        await route.continue_()
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +302,9 @@ async def _try_click_more(page: Page) -> bool:
     for sel in MORE_BTN_SELECTORS:
         try:
             btn = page.locator(sel).first
-            if await btn.is_visible(timeout=2000):
+            if await btn.is_visible(timeout=500):
                 await btn.click()
-                await page.wait_for_timeout(1200)
+                await page.wait_for_timeout(400)
                 return True
         except Exception:
             continue
@@ -308,21 +338,24 @@ async def _dom_fallback(page: Page, meta: TikTokMetadata) -> None:
         meta.keywords = list(dict.fromkeys(kws))
 
 
-async def scrape_embed(video_id: str, meta: TikTokMetadata) -> None:
+async def scrape_embed(
+    video_id: str, meta: TikTokMetadata, browser: Optional[Browser] = None
+) -> None:
+    """
+    Scrape the TikTok embed page.
+
+    If *browser* is supplied (shared instance), a new context is opened inside
+    it so the caller controls the browser lifecycle.  Otherwise a dedicated
+    Playwright browser is launched and closed here.
+    """
     embed_url = f"{EMBED_BASE}{video_id}"
     intercepted_apis: list[str] = []
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-        )
+    async def _run(b: Browser) -> None:
+        context = await b.new_context(user_agent=USER_AGENT, locale="en-US")
         page = await context.new_page()
+        # Block images / fonts / media – we only need text data
+        await page.route("**/*", _block_heavy_resources)
 
         async def on_response(response: Response) -> None:
             url = response.url
@@ -342,14 +375,22 @@ async def scrape_embed(video_id: str, meta: TikTokMetadata) -> None:
 
         try:
             print(f"[embed] loading {embed_url}", file=sys.stderr)
-            await page.goto(embed_url, wait_until="networkidle", timeout=30_000)
+            # domcontentloaded returns as soon as the HTML is parsed; the
+            # server-rendered inline JSON is immediately available.
+            await page.goto(embed_url, wait_until="domcontentloaded", timeout=30_000)
 
-            # Primary: parse inline page JSON
+            # Primary: parse inline page JSON (server-rendered, already present)
             html = await page.content()
             if parse_page_json(html, video_id, meta):
                 print("[embed] parsed inline page JSON", file=sys.stderr)
             else:
                 print("[embed] inline page JSON not found", file=sys.stderr)
+
+            # Give XHR responses a short window to arrive for AI summary / keywords
+            try:
+                await page.wait_for_load_state("networkidle", timeout=4_000)
+            except PWTimeout:
+                pass
 
             if "--debug" in sys.argv:
                 debug_path = f"/tmp/tiktok_embed_{video_id}.html"
@@ -363,7 +404,17 @@ async def scrape_embed(video_id: str, meta: TikTokMetadata) -> None:
         except Exception as exc:
             print(f"[embed] error: {exc}", file=sys.stderr)
         finally:
-            await browser.close()
+            await context.close()
+
+    if browser is not None:
+        await _run(browser)
+    else:
+        async with async_playwright() as pw:
+            b = await pw.chromium.launch(headless=True, args=_BROWSER_ARGS)
+            try:
+                await _run(b)
+            finally:
+                await b.close()
 
 
 # ---------------------------------------------------------------------------
@@ -464,22 +515,25 @@ def parse_full_page_html(html: str, meta: TikTokMetadata) -> bool:
     return True
 
 
-async def scrape_full_page(canonical_url: str, meta: TikTokMetadata) -> None:
-    """Navigate to the full tiktok.com video page and extract metadata."""
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-        )
+async def scrape_full_page(
+    canonical_url: str, meta: TikTokMetadata, browser: Optional[Browser] = None
+) -> None:
+    """
+    Navigate to the full tiktok.com video page and extract metadata.
+
+    If *browser* is supplied (shared instance), a new context is opened inside
+    it.  Otherwise a dedicated Playwright browser is launched and closed here.
+    """
+    async def _run(b: Browser) -> None:
+        context = await b.new_context(user_agent=USER_AGENT, locale="en-US")
         page = await context.new_page()
+        # Block images / fonts / media – rehydration JSON is text-only
+        await page.route("**/*", _block_heavy_resources)
         try:
             print(f"[full_page] loading {canonical_url}", file=sys.stderr)
-            await page.goto(canonical_url, wait_until="networkidle", timeout=30_000)
+            # "load" fires after inline scripts execute (rehydration JSON is
+            # available) while being meaningfully faster than "networkidle".
+            await page.goto(canonical_url, wait_until="load", timeout=30_000)
             html = await page.content()
 
             if parse_full_page_html(html, meta):
@@ -511,7 +565,17 @@ async def scrape_full_page(canonical_url: str, meta: TikTokMetadata) -> None:
         except Exception as exc:
             print(f"[full_page] error: {exc}", file=sys.stderr)
         finally:
-            await browser.close()
+            await context.close()
+
+    if browser is not None:
+        await _run(browser)
+    else:
+        async with async_playwright() as pw:
+            b = await pw.chromium.launch(headless=True, args=_BROWSER_ARGS)
+            try:
+                await _run(b)
+            finally:
+                await b.close()
 
 
 # ---------------------------------------------------------------------------
@@ -536,20 +600,17 @@ async def capture_thumbnail(video_id: str, output_path: str) -> str:
     embed_url = f"{EMBED_BASE}{video_id}"
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, args=_BROWSER_ARGS)
         context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
+            user_agent=USER_AGENT,
             locale="en-US",
             viewport={"width": 540, "height": 960},
         )
         page = await context.new_page()
         try:
             print(f"[thumbnail] loading {embed_url}", file=sys.stderr)
-            await page.goto(embed_url, wait_until="networkidle", timeout=30_000)
+            # "load" is sufficient; we wait explicitly for the <video> element below
+            await page.goto(embed_url, wait_until="load", timeout=30_000)
 
             # Try to find the video element and get its bounding box
             clip = None
@@ -615,10 +676,17 @@ async def extract(url: str) -> TikTokMetadata:
         parse_oembed(oembed_data, meta)
 
     if meta.video_id:
-        # Run embed scrape and full-page scrape sequentially to avoid
-        # launching two Chromium instances simultaneously.
-        await scrape_embed(meta.video_id, meta)
-        await scrape_full_page(meta.url, meta)
+        # Share a single Chromium instance between both scrapes and run them
+        # concurrently – cuts total browser time roughly in half.
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, args=_BROWSER_ARGS)
+            try:
+                await asyncio.gather(
+                    scrape_embed(meta.video_id, meta, browser),
+                    scrape_full_page(meta.url, meta, browser),
+                )
+            finally:
+                await browser.close()
     else:
         print("[embed/full_page] skipped — no video ID", file=sys.stderr)
 
